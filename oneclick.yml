@@ -1,0 +1,110 @@
+
+name: One-Click Android Build (Fetch Map & Data, Build Signed AAB)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Fetch full Moscow metro SVG map (Wikimedia Commons)
+        run: |
+          mkdir -p app/src/main/assets
+          curl -L "https://commons.wikimedia.org/wiki/Special:FilePath/Moscow%20metro%20map%20sb.svg" -o app/src/main/assets/metro_map.svg
+          echo "Attribution: Moscow metro map sb.svg — Wikimedia Commons — CC BY-SA 4.0" > ATTRIBUTION.txt
+
+      - name: Fetch stations (Wikidata SPARQL → CSV)
+        run: |
+          Q=$(cat << 'EOF'
+          SELECT ?line ?lineLabel ?station ?stationLabel ?coord ?ordinal WHERE {
+            ?line wdt:P31/wdt:P279* wd:Q728937;
+                  wdt:P361 wd:Q5499.
+            ?station wdt:P31/wdt:P279* wd:Q928830;
+                     wdt:P625 ?coord.
+            ?line p:P527 ?part.
+            ?part ps:P527 ?station.
+            OPTIONAL { ?part pq:P1545 ?ordinal }
+            SERVICE wikibase:label { bd:serviceParam wikibase:language "ru,en". }
+          }
+          ORDER BY ?lineLabel (xsd:integer(?ordinal))
+          EOF
+          )
+          python - << 'PY'
+import urllib.parse, urllib.request, sys, os
+q = os.environ.get("Q")
+params = urllib.parse.urlencode({"query": q})
+url = "https://query.wikidata.org/sparql?format=csv&" + params
+with urllib.request.urlopen(url) as r:
+    csv = r.read()
+open("tools/wikidata_metro.csv","wb").write(csv)
+print("Downloaded CSV:", len(csv), "bytes")
+PY
+
+      - name: Convert CSV → JSON graph for app
+        run: |
+          python tools/convert_stations.py tools/wikidata_metro.csv tools/wikidata_metro.csv app/src/main/assets/stations_moscow_full.json
+
+      - name: Generate upload keystore if not provided
+        run: |
+          if [ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            keytool -genkeypair -noprompt -alias upload -dname "CN=MetroAlarm,O=User,C=PL" \
+              -keyalg RSA -keysize 2048 -validity 20000 \
+              -storetype JKS -keystore upload-keystore.jks \
+              -storepass android -keypass android
+            echo "Generated local keystore."
+          else
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > upload-keystore.jks
+            echo "Using provided keystore from secrets."
+          fi
+
+      - name: Prepare Gradle signing config
+        run: |
+          cat >> ~/.gradle/gradle.properties << 'EOF'
+          MYAPP_UPLOAD_STORE_FILE=upload-keystore.jks
+          MYAPP_UPLOAD_KEY_ALIAS=upload
+          MYAPP_UPLOAD_STORE_PASSWORD=android
+          MYAPP_UPLOAD_KEY_PASSWORD=android
+          EOF
+          echo "storeFile=${{ github.workspace }}/upload-keystore.jks" >> ~/.gradle/gradle.properties
+          # Patch build.gradle.kts signing if not present
+          if ! grep -q "signingConfigs" app/build.gradle.kts; then
+            awk '1; /android \\{/ && !done {print "  signingConfigs {\\n    create(\\"release\\") {\\n      storeFile = file(providers.gradleProperty(\\"storeFile\\").get())\\n      storePassword = providers.gradleProperty(\\"MYAPP_UPLOAD_STORE_PASSWORD\\").get()\\n      keyAlias = providers.gradleProperty(\\"MYAPP_UPLOAD_KEY_ALIAS\\").get()\\n      keyPassword = providers.gradleProperty(\\"MYAPP_UPLOAD_KEY_PASSWORD\\").get()\\n    }\\n  }\\n  buildTypes {\\n    release {\\n      signingConfig = signingConfigs.getByName(\\"release\\")\\n    }\\n  }"; done=1}' app/build.gradle.kts > app/build.gradle.kts.new
+            mv app/build.gradle.kts.new app/build.gradle.kts
+          fi
+
+      - name: Build Release AAB
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: 8.7
+          arguments: :app:bundleRelease
+
+      - name: Build Debug APK (optional)
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: 8.7
+          arguments: assembleDebug
+
+      - name: Upload artifacts (AAB, APK, Keystore)
+        uses: actions/upload-artifact@v4
+        with:
+          name: metroalarm-oneclick-build
+          path: |
+            app/build/outputs/bundle/release/*.aab
+            app/build/outputs/apk/debug/*.apk
+            upload-keystore.jks
+            ATTRIBUTION.txt
