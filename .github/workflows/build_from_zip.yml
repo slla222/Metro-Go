@@ -16,22 +16,28 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Python (for data convert)
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
+      # 1) Распаковываем ЛЮБОЙ zip и находим корень проекта по gradlew
       - name: Unzip project
         run: |
-          unzip -q "MetroAlarm_OneClickBuild_v3.zip" -d workspace
-          ls -la workspace
-          ls -la workspace/MetroAlarm
+          mkdir -p workspace
+          ZIP=$(ls -1 *.zip | head -n1)
+          echo "Using ZIP: $ZIP"
+          unzip -q "$ZIP" -d workspace
+          ROOT=$(dirname "$(find workspace -type f -name gradlew -print -quit)")
+          echo "ROOT=$ROOT" | tee -a $GITHUB_ENV
 
+      # 2) Кладём карту и тянем станции
       - name: Fetch full Moscow metro SVG map (Wikimedia)
         run: |
-          mkdir -p workspace/MetroAlarm/app/src/main/assets
-          curl -L "https://commons.wikimedia.org/wiki/Special:FilePath/Moscow%20metro%20map%20sb.svg" -o workspace/MetroAlarm/app/src/main/assets/metro_map.svg
-          echo "Attribution: Moscow metro map sb.svg — Wikimedia Commons — CC BY-SA 4.0" > workspace/MetroAlarm/ATTRIBUTION.txt
+          mkdir -p "${{ env.ROOT }}/app/src/main/assets"
+          curl -L "https://commons.wikimedia.org/wiki/Special:FilePath/Moscow%20metro%20map%20sb.svg" \
+            -o "${{ env.ROOT }}/app/src/main/assets/metro_map.svg"
+          echo "Attribution: Moscow metro map sb.svg — Wikimedia Commons — CC BY-SA 4.0" > "${{ env.ROOT }}/ATTRIBUTION.txt"
 
       - name: Fetch stations (Wikidata SPARQL → CSV)
         run: |
@@ -50,21 +56,22 @@ import urllib.parse, urllib.request, os, pathlib
 q = os.environ.get("Q")
 url = "https://query.wikidata.org/sparql?format=csv&" + urllib.parse.urlencode({"query": q})
 csv = urllib.request.urlopen(url).read()
-pathlib.Path("workspace/MetroAlarm/tools").mkdir(parents=True, exist_ok=True)
-open("workspace/MetroAlarm/tools/wikidata_metro.csv","wb").write(csv)
+pathlib.Path("${{ env.ROOT }}/tools").mkdir(parents=True, exist_ok=True)
+open("${{ env.ROOT }}/tools/wikidata_metro.csv","wb").write(csv)
 print("Downloaded CSV:", len(csv))
 PY
 
       - name: Convert CSV → JSON graph for app
         run: |
-          python workspace/MetroAlarm/tools/convert_stations.py \
-            workspace/MetroAlarm/tools/wikidata_metro.csv \
-            workspace/MetroAlarm/tools/wikidata_metro.csv \
-            workspace/MetroAlarm/app/src/main/assets/stations_moscow_full.json
+          python "${{ env.ROOT }}/tools/convert_stations.py" \
+            "${{ env.ROOT }}/tools/wikidata_metro.csv" \
+            "${{ env.ROOT }}/tools/wikidata_metro.csv" \
+            "${{ env.ROOT }}/app/src/main/assets/stations_moscow_full.json"
 
-      - name: Prepare signing (auto keystore if secrets absent)
+      # 3) Подпись (создаём временный upload-keystore, если свой не задан)
+      - name: Prepare signing
         run: |
-          cd workspace/MetroAlarm
+          cd "${{ env.ROOT }}"
           if [ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
             keytool -genkeypair -noprompt -alias upload -dname "CN=MetroAlarm,O=User,C=PL" \
               -keyalg RSA -keysize 2048 -validity 20000 \
@@ -78,26 +85,28 @@ PY
             echo "MYAPP_UPLOAD_KEY_ALIAS=upload"
             echo "MYAPP_UPLOAD_STORE_PASSWORD=android"
             echo "MYAPP_UPLOAD_KEY_PASSWORD=android"
-            echo "storeFile=${{ github.workspace }}/workspace/MetroAlarm/upload-keystore.jks"
+            echo "storeFile=${{ github.workspace }}/${{ env.ROOT }}/upload-keystore.jks"
           } >> ~/.gradle/gradle.properties
           chmod +x gradlew
 
+      # 4) Сборка
       - name: Build Release AAB
         run: |
-          cd workspace/MetroAlarm
+          cd "${{ env.ROOT }}"
           ./gradlew :app:bundleRelease
 
       - name: Build Debug APK
         run: |
-          cd workspace/MetroAlarm
+          cd "${{ env.ROOT }}"
           ./gradlew assembleDebug
 
+      # 5) Артефакты
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: metroalarm-oneclick-build
           path: |
-            workspace/MetroAlarm/app/build/outputs/bundle/release/*.aab
-            workspace/MetroAlarm/app/build/outputs/apk/debug/*.apk
-            workspace/MetroAlarm/upload-keystore.jks
-            workspace/MetroAlarm/ATTRIBUTION.txt
+            ${{ env.ROOT }}/app/build/outputs/bundle/release/*.aab
+            ${{ env.ROOT }}/app/build/outputs/apk/debug/*.apk
+            ${{ env.ROOT }}/upload-keystore.jks
+            ${{ env.ROOT }}/ATTRIBUTION.txt
