@@ -2,6 +2,11 @@ name: Build from ZIP (AAB + APK)
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'MetroAlarm_OneClickBuild_v3.zip'
+      - '.github/workflows/build_from_zip.yml'
+
 
 jobs:
   build:
